@@ -1,0 +1,5 @@
+# 《大道演化》写作系统 依赖
+# 核心依赖全部为 Python 标准库，无需额外安装
+# 仅打包时需要 PyInstaller
+
+pyinstaller>=6.0

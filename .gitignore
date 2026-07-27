@@ -1,0 +1,40 @@
+# 运行时生成的配置（包含 API key）
+config.json
+projects/*/config.json
+dist/data/*/config.json
+
+# 生成的章节和日志
+chapters/
+raw/
+logs/
+*.log
+
+# 多项目数据（用户创建的故事项目）
+projects/
+dist/data/
+
+# 打包产物
+dist/
+build/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+
+# 测试文件
+test_*.py
+_test.py
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
