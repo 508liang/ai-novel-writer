@@ -12,6 +12,8 @@ from tkinter import ttk, messagebox, simpledialog, filedialog
 from pathlib import Path
 from datetime import datetime
 
+from project_store import ProjectStore, atomic_write_text, create_project, event_identifier, validate_project_name
+
 # ==================== 常量 ====================
 
 import sys
@@ -25,7 +27,14 @@ else:
     _DATA_DIR = Path(__file__).parent
 
 ROOT_DIR = _DATA_DIR
-PROJECTS_DIR = ROOT_DIR / "projects"
+# Older source versions and the user's existing workspace projects live one
+# level above the application folder.  They remain visible without copying or
+# rewriting their chapter files.
+LEGACY_PROJECTS_DIR = ROOT_DIR.parent / "projects"
+if not getattr(sys, "frozen", False) and LEGACY_PROJECTS_DIR.exists():
+    PROJECTS_DIR = LEGACY_PROJECTS_DIR
+else:
+    PROJECTS_DIR = ROOT_DIR / "projects"
 PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # 停止标志（全局，用于中断写作线程）
@@ -77,29 +86,48 @@ def make_card(parent, **pack_kw):
 
 class ProjectManager:
     def __init__(self):
-        self._d = PROJECTS_DIR; self._d.mkdir(exist_ok=True); self._cur = None
+        self._d = PROJECTS_DIR; self._d.mkdir(parents=True, exist_ok=True); self._cur = None
+
+    def _roots(self):
+        roots = [self._d]
+        try:
+            if LEGACY_PROJECTS_DIR.resolve() != self._d.resolve() and LEGACY_PROJECTS_DIR.exists():
+                roots.append(LEGACY_PROJECTS_DIR)
+        except OSError:
+            pass
+        return roots
 
     def list(self):
-        return [d.name for d in sorted(self._d.iterdir()) if d.is_dir()]
+        names = {}
+        for root in self._roots():
+            for directory in root.iterdir():
+                if directory.is_dir() and not directory.name.startswith("."):
+                    names.setdefault(directory.name, directory)
+        return sorted(names)
 
     def dir(self, name=None):
-        if name: return self._d / name
+        if name:
+            for root in self._roots():
+                candidate = root / name
+                if candidate.is_dir():
+                    return candidate
+            return self._d / name
         return self._cur
 
-    def create(self, name):
-        d = self._d / name; d.mkdir(exist_ok=True)
-        for s in ("chapters","raw","logs"): (d/s).mkdir(exist_ok=True)
-        return d
+    def create(self, name, premise=""):
+        return create_project(self._d, name, premise=premise).project_dir
 
     def delete(self, name):
-        d = self._d / name
-        if d.exists(): shutil.rmtree(d)
+        d = self.dir(name)
+        allowed = [root.resolve() for root in self._roots()]
+        if d.exists() and any(d.resolve().parent == root for root in allowed):
+            shutil.rmtree(d)
 
     def set(self, name):
-        self._cur = self._d / name
+        self._cur = self.dir(name)
 
     def exists(self, name):
-        return (self._d / name).is_dir()
+        return self.dir(name).is_dir()
 
 
 pm = ProjectManager()
@@ -265,7 +293,8 @@ class SettingsDialog(tk.Toplevel):
             "output":{"show_progress":True,"save_raw":True,"auto_backup":True}
         }
         self._ed.mkdir(parents=True, exist_ok=True)
-        (self._ed/"config.json").write_text(json.dumps(cfg,ensure_ascii=False,indent=2),"utf-8")
+        from project_store import atomic_write_json
+        atomic_write_json(self._ed/"config.json", cfg, backup=True)
         import agents; agents.CONFIG = cfg
         messagebox.showinfo("完成", "配置已保存", parent=self); self.destroy()
 
@@ -346,8 +375,8 @@ class MainWindow:
         card = make_card(parent, **sp)
         self._proj_card(card)
 
-        sp_idea = {"padx":4, "pady":(0, 6), "fill":tk.BOTH, "expand":True}
-        card = make_card(parent, **sp_idea)
+        # 故事创意 - 固定高度，不扩展
+        card = make_card(parent, **sp)
         self._idea_card(card)
 
         card = make_card(parent, **sp)
@@ -378,40 +407,31 @@ class MainWindow:
         tk.Label(pref, text="偏好", font=(FONT,11), bg=C_CARD, fg=C_TEXT2).pack(side=tk.LEFT)
         self._pref_len = tk.StringVar(value="长篇")
         ttk.Combobox(pref, textvariable=self._pref_len, values=["长篇","短篇"], state="readonly",
-                     width=6, font=(FONT,11)).pack(side=tk.LEFT, padx=(6,12))
+                     width=5, font=(FONT,11)).pack(side=tk.LEFT, padx=(4,8))
         self._pref_style = tk.StringVar(value="轻松")
         ttk.Combobox(pref, textvariable=self._pref_style, values=["轻松","复杂"], state="readonly",
-                     width=6, font=(FONT,11)).pack(side=tk.LEFT, padx=(0,0))
+                     width=5, font=(FONT,11)).pack(side=tk.LEFT)
 
-        f = tk.Frame(p, bg=C_CARD); f.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0,8))
+        # 文本框 - 固定高度
+        f = tk.Frame(p, bg=C_CARD); f.pack(fill=tk.X, padx=12, pady=(0,8))
         self._idea = tk.Text(f, wrap=tk.WORD, font=(FONT,13), bg=C_INPUT, fg=C_TEXT,
                              relief=tk.FLAT, insertbackground=C_TEXT, padx=10, pady=6, height=4)
         s = ttk.Scrollbar(f, orient=tk.VERTICAL, command=self._idea.yview)
         self._idea.configure(yscrollcommand=s.set)
-        self._idea.pack(side=tk.LEFT, fill=tk.BOTH, expand=True); s.pack(side=tk.RIGHT, fill=tk.Y)
+        self._idea.pack(side=tk.LEFT, fill=tk.X, expand=True); s.pack(side=tk.RIGHT, fill=tk.Y)
         self._setup_ph()
 
     def _action_card(self, p):
         tk.Label(p, text="操作", font=(FONT,13,"bold"), bg=C_CARD, fg=C_TEXT).pack(
             fill=tk.X, padx=12, pady=(10,2))
 
-        # 步骤指示
-        steps = [
-            ("① 生成框架", "点击生成 →", self._gen_fw, C_ACCENT),
-            ("② 选择事件", "从下拉选择 →", None, None),
-            ("③ 开始写作", "逐章写 或 一口气整卷", None, None),
-        ]
-        for label, hint, cmd, color in steps:
-            row = tk.Frame(p, bg=C_CARD); row.pack(fill=tk.X, padx=12, pady=2)
-            if color:
-                tk.Button(row, text=label, font=(FONT,13), bg=color, fg="#FFF",
-                          relief=tk.FLAT, padx=10, pady=4, command=cmd).pack(side=tk.LEFT)
-                tk.Label(row, text=hint, font=(FONT,11), bg=C_CARD, fg=C_MUTED).pack(side=tk.LEFT, padx=8)
-            else:
-                tk.Label(row, text=label, font=(FONT,12), bg=C_CARD, fg=C_TEXT).pack(side=tk.LEFT)
+        # 生成框架按钮
+        tk.Button(p, text="① 生成故事框架", font=(FONT,13), bg=C_ACCENT, fg="#FFF",
+                  relief=tk.FLAT, padx=10, pady=4, command=self._gen_fw).pack(
+                  fill=tk.X, padx=12, pady=(0,6))
 
         # 事件选择器
-        er = tk.Frame(p, bg=C_CARD); er.pack(fill=tk.X, padx=12, pady=(4,4))
+        er = tk.Frame(p, bg=C_CARD); er.pack(fill=tk.X, padx=12, pady=(0,4))
         self._ev = tk.StringVar()
         self._ec = ttk.Combobox(er, textvariable=self._ev, state="readonly", font=(FONT,12))
         self._ec.pack(side=tk.LEFT, fill=tk.X, expand=True)
@@ -424,27 +444,27 @@ class MainWindow:
                                 fg=C_MUTED, anchor="w", wraplength=340, justify="left")
         self._ed_lbl.pack(fill=tk.X, padx=12, pady=(0,6))
 
-        # 写作按钮行1：单事件 + 整卷
+        # 写作按钮行
         br = tk.Frame(p, bg=C_CARD); br.pack(fill=tk.X, padx=12, pady=(0,4))
-        tk.Button(br, text="写当前事件", font=(FONT,13), bg=C_TEXT, fg="#FFF",
-                  relief=tk.FLAT, padx=10, pady=5, command=self._write_sel).pack(
-                  side=tk.LEFT, fill=tk.X, expand=True, padx=(0,3))
-        tk.Button(br, text="一口气写整卷", font=(FONT,13), bg=C_TEXT, fg="#FFF",
-                  relief=tk.FLAT, padx=10, pady=5, command=self._write_vol).pack(
-                  side=tk.LEFT, fill=tk.X, expand=True, padx=(3,0))
+        tk.Button(br, text="写当前", font=(FONT,12), bg=C_TEXT, fg="#FFF",
+                  relief=tk.FLAT, padx=8, pady=4, command=self._write_sel).pack(
+                  side=tk.LEFT, fill=tk.X, expand=True, padx=(0,2))
+        tk.Button(br, text="写整卷", font=(FONT,12), bg=C_TEXT, fg="#FFF",
+                  relief=tk.FLAT, padx=8, pady=4, command=self._write_vol).pack(
+                  side=tk.LEFT, fill=tk.X, expand=True, padx=(2,2))
+        tk.Button(br, text="续写", font=(FONT,12), bg=C_ACCENT, fg="#FFF",
+                  relief=tk.FLAT, padx=8, pady=4, command=self._continue_write).pack(
+                  side=tk.LEFT, fill=tk.X, expand=True, padx=(2,0))
 
-        # 写作按钮行2：续写
-        br2 = tk.Frame(p, bg=C_CARD); br2.pack(fill=tk.X, padx=12, pady=(0,6))
-        tk.Button(br2, text="续写新篇章", font=(FONT,13), bg=C_ACCENT, fg="#FFF",
-                  relief=tk.FLAT, padx=10, pady=5, command=self._continue_write).pack(
-                  fill=tk.X)
+        tk.Button(p, text="恢复上次断点", font=(FONT,11), bg=C_INPUT, fg=C_TEXT,
+                  relief=tk.FLAT, padx=8, pady=3, command=self._resume_checkpoint).pack(
+                  fill=tk.X, padx=12, pady=(0,6))
 
-        # 补充信息
-        info = tk.Frame(p, bg=C_CARD); info.pack(fill=tk.X, padx=12, pady=(0,6))
-        tk.Label(info, text="💡 续写：基于已写内容自动生成后续事件", font=(FONT,10), bg=C_CARD, fg=C_MUTED).pack(side=tk.LEFT)
-        self._btn_stop = tk.Button(info, text="停止", font=(FONT,10), bg=C_INPUT, fg=C_TEXT,
-                                    relief=tk.FLAT, padx=6, command=self._stop, state=tk.DISABLED)
-        self._btn_stop.pack(side=tk.RIGHT)
+        # 停止按钮
+        self._btn_stop = tk.Button(p, text="停止", font=(FONT,11), bg=C_INPUT, fg=C_TEXT,
+                                    relief=tk.FLAT, padx=8, pady=2,
+                                    command=self._stop, state=tk.DISABLED)
+        self._btn_stop.pack(fill=tk.X, padx=12, pady=(0,8))
 
     def _files_card(self, p):
         tk.Label(p, text="项目文件", font=(FONT,13,"bold"), bg=C_CARD, fg=C_TEXT).pack(fill=tk.X, padx=12, pady=(10,2))
@@ -581,7 +601,10 @@ class MainWindow:
 
     def _init(self):
         self._rf_proj(); projects = pm.list()
-        if not projects: pm.create("默认项目"); self._rf_proj(); projects = pm.list()
+        if not projects:
+            # 首次使用 - 显示欢迎对话框
+            self._show_welcome()
+            pm.create("默认项目"); self._rf_proj(); projects = pm.list()
         # 恢复上次使用的项目
         last = self._load_last_project()
         if last and last in projects:
@@ -592,6 +615,37 @@ class MainWindow:
         if not is_api_configured():
             if messagebox.askyesno("配置 API","尚未配置 API，是否现在配置？\n\nAPI 配置保存在项目目录的 config.json 中。"):
                 self._settings()
+        checkpoint = ProjectStore(self._project_dir).load_checkpoint()
+        if checkpoint:
+            self._log(f"[记] 检测到未完成断点：{checkpoint.get('event_name', '写作任务')}，可点击“恢复上次断点”继续")
+
+    def _show_welcome(self):
+        """首次使用的欢迎对话框"""
+        welcome = tk.Toplevel(self.root)
+        welcome.title("欢迎使用")
+        welcome.geometry("420x300")
+        welcome.resizable(False, False)
+        welcome.transient(self.root)
+        welcome.grab_set()
+        welcome.configure(bg=C_BG)
+
+        tk.Label(welcome, text="📖 AI 网文写作系统", font=(FONT,16,"bold"),
+                 bg=C_BG, fg=C_TEXT).pack(pady=(20,10))
+
+        steps = [
+            "1. 配置 API（支持 OpenAI、DeepSeek 等）",
+            "2. 输入故事创意，点击「生成故事框架」",
+            "3. 选择事件，开始写作",
+            "4. 支持断点续写，随时可中断",
+        ]
+        for s in steps:
+            tk.Label(welcome, text=s, font=(FONT,12), bg=C_BG, fg=C_TEXT2,
+                     anchor="w").pack(fill=tk.X, padx=30, pady=2)
+
+        tk.Button(welcome, text="开始使用", font=(FONT,13), bg=C_ACCENT, fg="#FFF",
+                  relief=tk.FLAT, padx=20, pady=6, command=welcome.destroy).pack(pady=20)
+
+        self.root.wait_window(welcome)
 
     def _load_last_project(self):
         """读取上次使用的项目名"""
@@ -604,13 +658,17 @@ class MainWindow:
     def _save_last_project(self, name):
         """保存当前项目名"""
         f = ROOT_DIR / ".last_project"
-        try: f.write_text(name, "utf-8")
+        try: atomic_write_text(f, name)
         except: pass
 
     def _rf_proj(self): self._p_combo["values"] = pm.list()
 
     def _on_proj(self, e=None):
-        if self._pv.get(): self._sw_proj(self._pv.get())
+        if self._pv.get():
+            if self._running:
+                messagebox.showwarning("提示", "当前有写作任务正在运行，请先停止任务。", parent=self.root)
+                return
+            self._sw_proj(self._pv.get())
 
     def _sw_proj(self, name):
         pm.set(name); d = pm.dir()
@@ -622,15 +680,24 @@ class MainWindow:
         agents.CONFIG_FILE = d/"config.json"
         for s in ("chapters","raw","logs"): (d/s).mkdir(exist_ok=True)
         agents.CONFIG = agents.load_config()
+        ProjectStore(d).ensure_structure(name=name)
+        agents.configure_project_logging(d)
+        agents.set_stop_checker(_stop_event.is_set)
         self._pl.config(text=name); self._load_fw(); self._rf_files(); self._rf_ch()
         # 更新状态栏进度
         from agents import WritingNotes
-        notes = WritingNotes.load()
+        notes = WritingNotes.load(d / "writing_notes.json")
         ch_count = len(list((d/"chapters").glob("ch*.md"))) if (d/"chapters").exists() else 0
-        self._wl.config(text=f"章节 {ch_count} | 事件 {len(notes.events_completed)} | 字数 {notes.total_words}")
+        summary = ProjectStore(d).summary()
+        checkpoint = summary.get("checkpoint")
+        task_hint = f" | 待恢复：{checkpoint.get('event_name','写作任务')}" if checkpoint else ""
+        self._wl.config(text=f"章节 {ch_count} | 事件 {len(notes.events_completed)} | 字数 {notes.total_words}{task_hint}")
         self._log(f"[切换] {name}")
 
     def _new_proj(self):
+        if self._running:
+            messagebox.showwarning("提示", "当前有写作任务正在运行，请先停止任务。", parent=self.root)
+            return
         n = simpledialog.askstring("新建项目","项目名称：",parent=self.root)
         if not n or not n.strip(): return
         n = n.strip()
@@ -650,9 +717,17 @@ class MainWindow:
             while pm.exists(n):
                 n = f"{base}_{i}"; i += 1
             messagebox.showinfo("提示",f"项目名称已存在，自动重命名为：\n「{n}」")
-        pm.create(n); self._rf_proj(); self._p_combo.set(n); self._sw_proj(n)
+        try:
+            pm.create(n, premise="" if self._ph_active else self._idea.get("1.0", tk.END).strip())
+        except Exception as e:
+            messagebox.showerror("创建失败", str(e), parent=self.root)
+            return
+        self._rf_proj(); self._p_combo.set(n); self._sw_proj(n)
 
     def _del_proj(self):
+        if self._running:
+            messagebox.showwarning("提示", "当前有写作任务正在运行，请先停止任务。", parent=self.root)
+            return
         n = self._pv.get()
         if not n: return
         if not messagebox.askyesno("确认",f"删除项目「{n}」？不可恢复。"): return
@@ -662,13 +737,31 @@ class MainWindow:
         else: pm.create("默认项目"); self._rf_proj(); self._p_combo.set("默认项目"); self._sw_proj("默认项目")
 
     def _imp_proj(self):
+        if self._running:
+            messagebox.showwarning("提示", "当前有写作任务正在运行，请先停止任务。", parent=self.root)
+            return
         s = filedialog.askdirectory(title="选择项目文件夹", parent=self.root)
         if not s: return
-        n = Path(s).name
+        source = Path(s).resolve()
+        n = source.name
+        target = (PROJECTS_DIR / n).resolve()
+        if source == target:
+            messagebox.showinfo("导入项目", "所选目录已经是当前项目目录，无需重复导入。", parent=self.root)
+            self._p_combo.set(n); self._sw_proj(n)
+            return
+        if (
+            source == PROJECTS_DIR.resolve()
+            or PROJECTS_DIR.resolve() in source.parents
+            or source in target.parents
+        ):
+            messagebox.showerror("导入失败", "不能把项目根目录或其内部目录作为项目整体导入。", parent=self.root)
+            return
         if pm.exists(n):
             if not messagebox.askyesno("提示",f"「{n}」已存在，覆盖？"): return
             pm.delete(n)
-        shutil.copytree(s, str(PROJECTS_DIR/n)); self._rf_proj()
+        shutil.copytree(source, target)
+        ProjectStore(target).ensure_structure(name=n)
+        self._rf_proj()
         self._p_combo.set(n); self._sw_proj(n)
 
     # ==================== 框架 ====================
@@ -683,6 +776,17 @@ class MainWindow:
                 except Exception as e: w.insert("1.0",f"[读取失败：{e}]")
         self._load_evts()
 
+    def _refresh_progress(self):
+        """Refresh the status bar from persisted state after any task."""
+        if not self._project_dir or not self._project_dir.exists():
+            return
+        summary = ProjectStore(self._project_dir).summary()
+        checkpoint = summary.get("checkpoint")
+        task_hint = f" | 待恢复：{checkpoint.get('event_name','写作任务')}" if checkpoint else ""
+        self._wl.config(
+            text=f"章节 {summary['chapters']} | 事件 {summary['events']} | 字数 {summary['words']}{task_hint}"
+        )
+
     @property
     def _ed(self): return self._project_dir
 
@@ -691,7 +795,15 @@ class MainWindow:
         for fname,w in [("story_plan.md",self._pt),("characters.md",self._ct),("events_config.json",self._evt_t)]:
             c = w.get("1.0",tk.END).strip()
             if c:
-                try: (d/fname).write_text(c,"utf-8")
+                try:
+                    from project_store import atomic_write_json, atomic_write_text
+                    if fname.endswith(".json"):
+                        atomic_write_json(d/fname, json.loads(c), backup=True)
+                    else:
+                        atomic_write_text(d/fname, c, backup=True)
+                except json.JSONDecodeError:
+                    messagebox.showerror("错误", "events_config.json 不是有效 JSON")
+                    return
                 except Exception as e: messagebox.showerror("错误",f"保存 {fname} 失败：{e}"); return
         messagebox.showinfo("完成","已保存")
 
@@ -705,13 +817,16 @@ class MainWindow:
         if not f.exists():
             self._ec["values"] = ["（未生成故事框架）"]; return
         try:
-            data = json.loads(f.read_text("utf-8"))
-            evts = data if isinstance(data,list) else data.get("events",[])
+            store = ProjectStore(self._project_dir)
+            store.ensure_event_indices()
+            evts, _ = store.load_events()
             self._evts_data = evts
             names = []
             for i,evt in enumerate(evts):
                 nm = evt.get("name",evt.get("event_name",f"事件{i+1}"))
-                names.append(f"{i+1}. {nm}")
+                status = evt.get("status", "pending")
+                status_label = {"completed": "已完成", "writing": "进行中", "paused": "已暂停"}.get(status, "待写")
+                names.append(f"{i+1}. [{status_label}] {nm}")
             if names: self._ec["values"] = names; self._ec.set(names[0]); self._on_evt()
             else: self._ec["values"] = ["（事件列表为空）"]
         except Exception as e: self._ec["values"] = [f"（解析失败：{str(e)[:30]}）"]
@@ -726,6 +841,8 @@ class MainWindow:
                 sm = evt.get("summary",evt.get("event_summary",""))
                 ch = evt.get("characters",[]); sc = evt.get("scene","")
                 d = sm
+                status = evt.get("status", "pending")
+                d = f"状态：{ {'completed':'已完成','writing':'进行中','paused':'已暂停'}.get(status, '待写') }\n" + d
                 if ch: d += f"\n角色：{'、'.join(ch)}"
                 if sc: d += f"\n场景：{sc}"
                 self._ed_lbl.config(text=d, fg=C_TEXT)
@@ -742,9 +859,10 @@ class MainWindow:
                 evt = self._evts_data[idx]
                 nm = evt.get("name",evt.get("event_name",""))
                 sm = evt.get("summary",evt.get("event_summary",nm))
+                event_index = event_identifier(evt)
                 def do():
-                    from agents import NovelWritingSystem; s = NovelWritingSystem()
-                    s.run_event(nm, sm)
+                    from agents import NovelWritingSystem; s = NovelWritingSystem(self._project_dir, _stop_event.is_set)
+                    s.run_event(nm, sm, event_index=event_index)
                     self.root.after(0, self._rf_ch); self.root.after(0, self._rf_files)
                     self.root.after(0, lambda: self._log(f"[OK] 「{nm}」完成，可继续选择下一个事件"))
                 self._run(do)
@@ -753,7 +871,7 @@ class MainWindow:
 
     def _write_vol(self):
         from agents import WritingNotes
-        notes = WritingNotes.load()
+        notes = WritingNotes.load(self._project_dir / "writing_notes.json")
         done = len(notes.events_completed)
         if done > 0:
             if not messagebox.askyesno("断点续写",
@@ -762,9 +880,36 @@ class MainWindow:
                                        f"是否继续？"):
                 return
         def do():
-            from agents import NovelWritingSystem; s = NovelWritingSystem()
+            from agents import NovelWritingSystem; s = NovelWritingSystem(self._project_dir, _stop_event.is_set)
             s.run_volume(s.notes.current_volume)
             self.root.after(0, self._rf_ch); self.root.after(0, self._rf_files)
+        self._run(do)
+
+    def _resume_checkpoint(self):
+        """Resume the active task saved in the current project's checkpoint."""
+        store = ProjectStore(self._project_dir)
+        checkpoint = store.load_checkpoint()
+        if not checkpoint:
+            messagebox.showinfo("恢复断点", "当前项目没有可恢复的任务。", parent=self.root)
+            return
+        stage = checkpoint.get("stage", "writing")
+        event = checkpoint.get("event_name", "未命名事件")
+        if not messagebox.askyesno(
+            "恢复断点",
+            f"检测到未完成任务：{event}\n当前阶段：{stage}\n\n是否继续？",
+            parent=self.root,
+        ):
+            return
+
+        def do():
+            from agents import NovelWritingSystem
+            system = NovelWritingSystem(self._project_dir, _stop_event.is_set)
+            system.resume_checkpoint()
+            self.root.after(0, self._load_fw)
+            self.root.after(0, self._rf_ch)
+            self.root.after(0, self._rf_files)
+            self.root.after(0, lambda: self._log(f"[恢复] 已处理断点：{event}"))
+
         self._run(do)
 
     def _continue_write(self):
@@ -809,7 +954,7 @@ class MainWindow:
 
         # 读取已有事件记录
         from agents import WritingNotes
-        notes = WritingNotes.load()
+        notes = WritingNotes.load(d / "writing_notes.json")
         done_events = "\n".join([f"- {e.get('name','')}" for e in notes.events_completed[-10:]])
 
         # 构建续写提示
@@ -883,9 +1028,12 @@ class MainWindow:
             # 追加到 events_config.json
             evt_file = d / "events_config.json"
             existing = []
+            wrapped = False
             if evt_file.exists():
                 try:
+                    ProjectStore(d).ensure_event_indices()
                     old = json.loads(evt_file.read_text("utf-8"))
+                    wrapped = isinstance(old, dict)
                     existing = old if isinstance(old, list) else old.get("events", [])
                 except Exception:
                     pass
@@ -900,10 +1048,14 @@ class MainWindow:
             existing.extend(events)
 
             # 保存
-            if isinstance(old, list):
-                evt_file.write_text(json.dumps(existing, ensure_ascii=False, indent=2), "utf-8")
+            from project_store import atomic_write_json
+            if wrapped:
+                payload = dict(old) if isinstance(old, dict) else {}
+                payload["events"] = existing
             else:
-                evt_file.write_text(json.dumps({"events": existing}, ensure_ascii=False, indent=2), "utf-8")
+                payload = existing
+            atomic_write_json(evt_file, payload, backup=True)
+            ProjectStore(d).ensure_event_indices()
 
             # 刷新
             self.root.after(0, self._load_fw)
@@ -1008,6 +1160,8 @@ class MainWindow:
         self._running = r
         self._sl.config(text="运行中..." if r else "就绪")
         self._btn_stop.config(state=tk.NORMAL if r else tk.DISABLED)
+        if not r:
+            self._refresh_progress()
 
     def _run(self, func, *a, **kw):
         if self._running: messagebox.showwarning("提示","有任务正在运行"); return
@@ -1018,13 +1172,14 @@ class MainWindow:
             except Exception as e: self.root.after(0,lambda:self._log(f"[X] 错误：{e}"))
             finally:
                 self.root.after(0,self._set_r,False)
+                self.root.after(0,self._refresh_progress)
                 if _stop_event.is_set():
                     self.root.after(0,lambda:self._log("[!] 已停止"))
         threading.Thread(target=wrap, daemon=True).start()
 
     def _stop(self):
         _stop_event.set()
-        self._running = False; self._set_r(False); self._log("[!] 已请求停止（当前事件完成后停止）")
+        self._log("[!] 已请求停止（当前阶段完成后保存断点）")
 
     def _settings(self):
         SettingsDialog(self.root, self._project_dir)

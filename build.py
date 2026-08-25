@@ -38,9 +38,7 @@ def main():
         "--windowed",                   # 无控制台窗口
         "--name", "AI网文写作系统",     # exe 名称
         "--clean",                      # 清理临时文件
-        # 包含必要的数据文件
-        "--add-data", f"agents.py;.",
-        "--add-data", f"gui.py;.",
+        "--noconfirm",                  # 覆盖旧打包缓存时不询问
         # 隐藏导入
         "--hidden-import", "tkinter",
         "--hidden-import", "json",
@@ -48,6 +46,8 @@ def main():
         "--hidden-import", "threading",
         "--hidden-import", "urllib.request",
         "--hidden-import", "concurrent.futures",
+        "--hidden-import", "project_store",
+        "--hidden-import", "memory_index",
         # 入口文件
         str(PROJECT_DIR / "gui.py"),
     ]
@@ -72,9 +72,9 @@ def main():
             print(f"    大小：{size_mb:.1f} MB")
             print(f"{'=' * 60}")
             print(f"\n注意：")
-            print(f"  1. 首次运行 exe 会自动生成 config.json")
-            print(f"  2. 故事素材文件(story_plan.md等)会在运行时生成")
-            print(f"  3. 章节输出在 exe 同目录的 chapters/ 文件夹")
+            print(f"  1. 首次运行会在 data/projects/默认项目/ 生成项目配置")
+            print(f"  2. 故事素材文件(story_plan.md等)会在项目目录中生成")
+            print(f"  3. 所有项目数据位于 exe 同目录的 data/projects/ 文件夹")
         else:
             print("[X] 打包完成但未找到 exe 文件")
 

@@ -26,8 +26,19 @@ import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Callable
+from typing import Any, Dict, List, Optional, Tuple, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from project_store import (
+    ProjectStore,
+    atomic_write_json,
+    atomic_write_text,
+    count_story_chars,
+    chapter_filename,
+    event_identifier,
+    safe_filename,
+)
+from memory_index import StoryMemory
 
 
 # ==================== GUI 回调系统 ====================
@@ -36,6 +47,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 _on_output: Optional[Callable[[str], None]] = None
 _on_input: Optional[Callable[[str], str]] = None
 _on_confirm: Optional[Callable[[str], bool]] = None
+_stop_checker: Optional[Callable[[], bool]] = None
 
 
 _original_print = print  # 保存原始 print
@@ -84,6 +96,22 @@ def setup_gui_callbacks(
         sys.stdout = _gui_stream._original
 
 
+def set_stop_checker(checker: Optional[Callable[[], bool]] = None):
+    """Register a cooperative stop callback without importing the GUI layer."""
+
+    global _stop_checker
+    _stop_checker = checker
+
+
+def should_stop() -> bool:
+    """Return whether the current writing task should checkpoint and stop."""
+
+    try:
+        return bool(_stop_checker and _stop_checker())
+    except Exception:
+        return False
+
+
 def gui_print(*args, **kwargs):
     """打印函数，支持 GUI 回调"""
     msg = " ".join(str(a) for a in args)
@@ -125,12 +153,6 @@ LOG_DIR = PROJECT_DIR / "logs"
 NOTES_FILE = PROJECT_DIR / "writing_notes.json"
 CONFIG_FILE = PROJECT_DIR / "config.json"
 
-# 确保目录存在
-CHAPTERS_DIR.mkdir(exist_ok=True)
-RAW_DIR.mkdir(exist_ok=True)
-LOG_DIR.mkdir(exist_ok=True)
-
-
 # ==================== 配置系统 ====================
 
 DEFAULT_CONFIG = {
@@ -145,7 +167,8 @@ DEFAULT_CONFIG = {
         "target_length": 15000,
         "max_rounds": 3,
         "chars_per_chapter": 5000,
-        "max_events_per_volume": 15
+        "max_events_per_volume": 15,
+        "checkpoint_interval": "stage",
     },
     "review": {
         "pass_score": 7.5,
@@ -164,14 +187,15 @@ DEFAULT_CONFIG = {
     }
 }
 
-def load_config() -> dict:
+def load_config(config_path: Optional[Path] = None) -> dict:
     """加载配置文件，如果不存在则创建默认配置"""
-    if CONFIG_FILE.exists():
+    path = Path(config_path) if config_path else CONFIG_FILE
+    if path.exists():
         try:
-            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+            with open(path, 'r', encoding='utf-8') as f:
                 config = json.load(f)
             # 合并默认配置（处理新增字段）
-            merged = DEFAULT_CONFIG.copy()
+            merged = json.loads(json.dumps(DEFAULT_CONFIG, ensure_ascii=False))
             for key, value in config.items():
                 if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
                     merged[key].update(value)
@@ -179,16 +203,21 @@ def load_config() -> dict:
                     merged[key] = value
             return merged
         except Exception as e:
-            logger.warning(f"加载配置失败：{e}，使用默认配置")
+            # The module logger is initialized after the first global config
+            # load, so this path must also be safe during import.
+            try:
+                logger.warning(f"加载配置失败：{e}，使用默认配置")
+            except NameError:
+                pass
 
-    # 创建默认配置文件
-    save_config(DEFAULT_CONFIG)
-    return DEFAULT_CONFIG
+    # 配置文件是项目运行时状态，不在模块导入阶段自动创建。
+    # 项目控制器初始化时会为新项目持久化默认配置。
+    return json.loads(json.dumps(DEFAULT_CONFIG, ensure_ascii=False))
 
-def save_config(config: dict):
+def save_config(config: dict, config_path: Optional[Path] = None):
     """保存配置到文件"""
-    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-        json.dump(config, f, ensure_ascii=False, indent=2)
+    path = Path(config_path) if config_path else CONFIG_FILE
+    atomic_write_json(path, config, backup=True)
 
 # 全局配置
 CONFIG = load_config()
@@ -196,17 +225,44 @@ CONFIG = load_config()
 
 # ==================== 日志配置 ====================
 
-log_filename = LOG_DIR / f"writing_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[
-        logging.FileHandler(log_filename, encoding='utf-8'),
-        logging.StreamHandler()
-    ]
+    handlers=[logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
+_project_log_handler = None
+
+
+class ProjectLogHandler(logging.Handler):
+    """Append one record at a time so project files are never held open."""
+
+    def __init__(self, path: Path):
+        super().__init__()
+        self.path = Path(path)
+
+    def emit(self, record):
+        try:
+            message = self.format(record)
+            with self.path.open("a", encoding="utf-8", newline="\n") as handle:
+                handle.write(message + "\n")
+        except OSError:
+            self.handleError(record)
+
+
+def configure_project_logging(project_dir: Path):
+    """Route controller logs to the active project's own logs directory."""
+    global _project_log_handler
+    log_dir = Path(project_dir) / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    if _project_log_handler is not None:
+        logger.removeHandler(_project_log_handler)
+        _project_log_handler.close()
+    log_path = log_dir / f"writing_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    handler = ProjectLogHandler(log_path)
+    handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+    logger.addHandler(handler)
+    _project_log_handler = handler
 
 
 # ==================== 笔记系统 ====================
@@ -215,6 +271,8 @@ logger = logging.getLogger(__name__)
 class WritingNotes:
     """创作笔记：记录故事进展，支持暂停/继续"""
     current_volume: int = 1
+    current_volume_start_index: int = 0
+    volume_start_initialized: bool = False
     current_event_index: int = 0
     total_chapters: int = 0
     total_words: int = 0
@@ -225,12 +283,15 @@ class WritingNotes:
     writing_decisions: List[str] = field(default_factory=list)  # 重要创作决定
     next_event_hint: str = ""  # 下一个事件的提示
     last_updated: str = ""  # 最后更新时间
+    file_path: Optional[Path] = field(default=None, repr=False, compare=False)
 
-    def save(self):
+    def save(self, path: Optional[Path] = None):
         """保存笔记到文件"""
         self.last_updated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         data = {
             "current_volume": self.current_volume,
+            "current_volume_start_index": self.current_volume_start_index,
+            "volume_start_initialized": self.volume_start_initialized,
             "current_event_index": self.current_event_index,
             "total_chapters": self.total_chapters,
             "total_words": self.total_words,
@@ -242,23 +303,27 @@ class WritingNotes:
             "next_event_hint": self.next_event_hint,
             "last_updated": self.last_updated,
         }
-        with open(NOTES_FILE, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        target = Path(path) if path else (self.file_path or NOTES_FILE)
+        atomic_write_json(target, data, backup=True)
+        self.file_path = target
         logger.info(f"笔记已保存：{len(self.events_completed)}个事件，{self.total_words}字")
 
     @classmethod
-    def load(cls) -> 'WritingNotes':
+    def load(cls, path: Optional[Path] = None) -> 'WritingNotes':
         """从文件加载笔记"""
-        if not NOTES_FILE.exists():
+        target = Path(path) if path else NOTES_FILE
+        if not target.exists():
             logger.info("未找到笔记文件，创建新笔记")
-            return cls()
+            return cls(file_path=target)
 
         try:
-            with open(NOTES_FILE, 'r', encoding='utf-8') as f:
+            with open(target, 'r', encoding='utf-8') as f:
                 data = json.load(f)
 
-            notes = cls()
+            notes = cls(file_path=target)
             notes.current_volume = data.get("current_volume", 1)
+            notes.current_volume_start_index = data.get("current_volume_start_index", 0)
+            notes.volume_start_initialized = data.get("volume_start_initialized", False)
             notes.current_event_index = data.get("current_event_index", 0)
             notes.total_chapters = data.get("total_chapters", 0)
             notes.total_words = data.get("total_words", 0)
@@ -274,7 +339,7 @@ class WritingNotes:
             return notes
         except Exception as e:
             logger.error(f"加载笔记失败：{e}")
-            return cls()
+            return cls(file_path=target)
 
     def add_event(self, event_name: str, event_summary: str, chapter_count: int, word_count: int, chapter_files: List[str] = None):
         """
@@ -351,6 +416,7 @@ class ChapterContext:
     """章节上下文：传递给写作Agent的背景信息"""
     event_name: str
     event_summary: str
+    event_index: Optional[Any] = None
     target_length: int = None  # 从配置加载
     previous_text: str = ""  # 前文内容
     character_states: Dict[str, str] = field(default_factory=dict)  # 角色状态
@@ -445,9 +511,9 @@ def call_api(system_prompt: str, user_prompt: str, max_tokens: int = 16000, temp
     return ""
 
 
-def load_project_file(filename: str) -> str:
+def load_project_file(filename: str, project_dir: Optional[Path] = None) -> str:
     """加载项目设定文件"""
-    filepath = PROJECT_DIR / filename
+    filepath = (Path(project_dir) if project_dir else PROJECT_DIR) / filename
     if filepath.exists():
         return filepath.read_text(encoding='utf-8')
     return ""
@@ -458,11 +524,12 @@ def load_project_file(filename: str) -> str:
 class StoryContext:
     """故事上下文：加载和管理项目设定（带缓存）"""
 
-    def __init__(self):
-        self.characters = load_project_file("characters.md")
-        self.story_plan = load_project_file("story_plan.md")
-        self.master_outline = load_project_file("outline/master.md")
-        self.tracking = load_project_file("tracking.md")
+    def __init__(self, project_dir: Optional[Path] = None):
+        self.project_dir = Path(project_dir) if project_dir else PROJECT_DIR
+        self.characters = load_project_file("characters.md", self.project_dir)
+        self.story_plan = load_project_file("story_plan.md", self.project_dir)
+        self.master_outline = load_project_file("outline/master.md", self.project_dir)
+        self.tracking = load_project_file("tracking.md", self.project_dir)
 
         # 缓存
         self._character_brief_cache: Optional[str] = None
@@ -1232,9 +1299,44 @@ JSON格式：
 class NovelWritingSystem:
     """小说写作系统：协调所有Agent"""
 
-    def __init__(self):
+    def __init__(self, project_dir: Optional[Path] = None, stop_checker: Optional[Callable[[], bool]] = None):
+        """Create an isolated writing controller for one project.
+
+        ``project_dir`` is explicit for new callers.  Falling back to the
+        module-level directory keeps the original CLI invocation compatible.
+        """
+        self.project_dir = Path(project_dir) if project_dir else PROJECT_DIR
+        self.store = ProjectStore(self.project_dir)
+        self.store.ensure_structure()
+        self.store.ensure_event_indices()
+        if not self.store.config_path.exists():
+            self.store.save_config(DEFAULT_CONFIG)
+        self.memory = StoryMemory(self.project_dir)
+        self.memory.rebuild_if_needed()
+        self._configure_project_paths()
+        if stop_checker is not None:
+            self.stop_checker = stop_checker
+        else:
+            self.stop_checker = should_stop
+
+    def _configure_project_paths(self):
+        """Keep legacy helpers working while the controller owns the project."""
+        global PROJECT_DIR, CHAPTERS_DIR, RAW_DIR, OUTLINE_DIR, LOG_DIR, NOTES_FILE, CONFIG_FILE, CONFIG
+        PROJECT_DIR = self.project_dir
+        CHAPTERS_DIR = self.store.chapters_dir
+        RAW_DIR = self.store.raw_dir
+        OUTLINE_DIR = self.project_dir / "outline"
+        LOG_DIR = self.store.logs_dir
+        NOTES_FILE = self.project_dir / "writing_notes.json"
+        CONFIG_FILE = self.store.config_path
+        CHAPTERS_DIR.mkdir(parents=True, exist_ok=True)
+        RAW_DIR.mkdir(parents=True, exist_ok=True)
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        configure_project_logging(self.project_dir)
+        CONFIG = load_config(CONFIG_FILE)
+
         # 加载故事上下文
-        self.story_context = StoryContext()
+        self.story_context = StoryContext(self.project_dir)
 
         # 初始化5个写作Agent（5个不同风格的作者）
         self.writer_a = WriterAgentA(self.story_context)  # 细雨：细腻派
@@ -1251,34 +1353,53 @@ class NovelWritingSystem:
         self.assistant = AssistantAgent(self.story_context)
 
         # 加载笔记系统
-        self.notes = WritingNotes.load()
+        self.notes = WritingNotes.load(self.project_dir / "writing_notes.json")
 
         # 当前状态
         self.current_context: Optional[ChapterContext] = None
         # 基于现有文件数量初始化章节计数
         existing_chapters = list(CHAPTERS_DIR.glob("ch*.md"))
-        self.chapter_count = len(existing_chapters)
+        chapter_numbers = []
+        for chapter in existing_chapters:
+            match = re.match(r"ch(\d+)", chapter.name, re.IGNORECASE)
+            if match:
+                chapter_numbers.append(int(match.group(1)))
+        self.chapter_count = max(chapter_numbers, default=0)
 
         # 章节摘要记录
         self.chapter_summaries: List[str] = self._load_chapter_summaries()
 
-        logger.info(f"写作系统初始化完成，已有{self.chapter_count}章")
+        logger.info(f"写作系统初始化完成，项目={self.project_dir.name}，已有{self.chapter_count}章")
         logger.info(f"笔记状态：{self.notes.get_summary()}")
 
     def _load_chapter_summaries(self) -> List[str]:
         """加载已有章节的摘要"""
-        summaries = []
-        chapter_files = sorted(CHAPTERS_DIR.glob("ch*.md"))
-        for ch_file in chapter_files:
+        summaries = [
+            f"{record.get('path', '')}: {record.get('summary', '')}"
+            for record in self.memory.records()
+            if record.get("path")
+        ]
+        if summaries:
+            return summaries
+        # Fallback for a newly imported project whose index has not been
+        # created yet.  Read only a short prefix, never the whole chapter.
+        for ch_file in sorted(CHAPTERS_DIR.glob("ch*.md")):
             try:
-                content = ch_file.read_text(encoding='utf-8')
-                summary = content[:100].replace('\n', ' ')
+                with ch_file.open("r", encoding="utf-8") as handle:
+                    summary = handle.read(240).replace("\n", " ")
                 summaries.append(f"{ch_file.name}: {summary}")
-            except Exception:
-                pass
+            except OSError:
+                continue
         return summaries
 
-    def run_event(self, event_name: str, event_summary: str, target_length: int = 15000, max_rounds: int = 3) -> str:
+    def run_event(
+        self,
+        event_name: str,
+        event_summary: str,
+        target_length: int = 15000,
+        max_rounds: int = 3,
+        event_index: Optional[Any] = None,
+    ) -> str:
         """
         运行一个事件
 
@@ -1295,6 +1416,19 @@ class NovelWritingSystem:
         logger.info(f"事件概述：{event_summary}")
         logger.info(f"目标字数：{target_length}")
 
+        # Mark the selected event before the first model call.  If the process
+        # stops here, the UI can still show exactly which event was active.
+        if event_index is None:
+            try:
+                event_index = self._event_index_for_name(event_name)
+            except Exception:
+                pass
+        self.store.update_event_status(event_name, "writing", event_index=event_index)
+        self._save_checkpoint(
+            "writing", event_name, event_summary,
+            status="running", event_index=event_index,
+        )
+
         print(f"\n{'='*60}")
         print(f"[书] 事件：{event_name}")
         print(f"[笔] 概述：{event_summary}")
@@ -1305,6 +1439,7 @@ class NovelWritingSystem:
         ctx = ChapterContext(
             event_name=event_name,
             event_summary=event_summary,
+            event_index=event_index,
             target_length=target_length
         )
 
@@ -1318,14 +1453,15 @@ class NovelWritingSystem:
 
         for round_num in range(max_rounds):
             # 检查停止标志
-            try:
-                from gui import _stop_event
-                if _stop_event.is_set():
-                    logger.info("收到停止信号，中断写作")
-                    print("[!] 收到停止信号，正在保存当前进度...")
-                    break
-            except ImportError:
-                pass
+            if self.stop_checker():
+                logger.info("收到停止信号，中断写作")
+                print("[!] 收到停止信号，正在保存当前进度...")
+                self.store.update_event_status(event_name, "paused", event_index=event_index)
+                self._save_checkpoint(
+                    "writing", event_name, event_summary,
+                    round_num=round_num, status="paused", event_index=event_index,
+                )
+                break
 
             logger.info(f"第{round_num + 1}轮写作")
             print(f"\n[轮] 第{round_num + 1}轮写作")
@@ -1334,6 +1470,17 @@ class NovelWritingSystem:
             # 1. 并行写作（3个Agent）
             print("[写]  三个写作Agent并行创作...")
             versions = self._write_parallel(ctx, round_num + 1)
+
+            if self.stop_checker():
+                draft = versions[0].content if versions else None
+                self.store.update_event_status(event_name, "paused", event_index=event_index)
+                self._save_checkpoint(
+                    "writing", event_name, event_summary,
+                    status="paused", round_num=round_num, draft_text=draft,
+                    event_index=event_index,
+                )
+                print("[!] 当前轮次已结束，已保存断点。")
+                return ""
 
             if not versions:
                 logger.warning("所有版本生成失败")
@@ -1387,22 +1534,64 @@ class NovelWritingSystem:
                 logger.info(f"选择最高分版本：{best_version.agent_name}（{best_review.score}分）")
                 print(f"  选择：{best_version.agent_name}（{best_review.score}分）")
 
+        if not best_text and self.stop_checker():
+            self.store.update_event_status(event_name, "paused", event_index=event_index)
+            self._save_checkpoint(
+                "writing", event_name, event_summary,
+                status="paused", event_index=event_index,
+            )
+            return ""
+
         # 检查是否真的有内容
         if not best_text or len(best_text) < 100:
             logger.error(f"事件 {event_name} 生成失败：无有效内容")
             print(f"\n[X] 事件 {event_name} 生成失败：所有写作Agent都未能生成有效内容")
             print(f" 建议：检查API连接或稍后重试")
+            self.store.update_event_status(event_name, "failed", event_index=event_index)
+            self._save_checkpoint(
+                "writing", event_name, event_summary,
+                status="failed", event_index=event_index,
+            )
             return ""
 
         # 直接使用最佳版本（不再润色）
         final_text = best_text
+        return self._finalize_event(final_text, ctx)
 
+    def _finalize_event(
+        self,
+        final_text: str,
+        ctx: ChapterContext,
+        existing_chapter_file: Optional[str] = None,
+    ) -> str:
+        """Analyze and commit a generated chapter as one recoverable unit."""
+        event_name = ctx.event_name
+        event_summary = ctx.event_summary
         # 4. 分析章节
+        self._save_checkpoint(
+            "analyzing", event_name, event_summary,
+            status="running", draft_text=final_text,
+            planned_chapter_file=chapter_filename(self.chapter_count + 1, event_name),
+            event_index=ctx.event_index,
+        )
         print("[析] 分析章节内容...")
         analysis = self.editor.analyze_chapter(final_text, ctx)
 
-        # 5. 保存结果（一个事件 = 一章，不拆分）
-        chapter_file, actual_chars = self._save_chapter(final_text, event_name)
+        # 5. 保存结果（一个事件 = 一章，不拆分）。如果进程曾在提交中途退出，
+        # 复用已经落盘的章节，避免恢复时生成重复章节。
+        chapter_file = existing_chapter_file or ""
+        chapter_path = CHAPTERS_DIR / chapter_file if chapter_file else None
+        if chapter_path and chapter_path.exists():
+            actual_chars = count_story_chars(chapter_path.read_text(encoding="utf-8"))
+        else:
+            chapter_file, actual_chars = self._save_chapter(final_text, event_name)
+
+        self._save_checkpoint(
+            "committing", event_name, event_summary,
+            status="running", draft_text=final_text,
+            chapter_file=chapter_file, actual_chars=actual_chars,
+            event_index=ctx.event_index,
+        )
 
         # 6. 更新追踪（使用助手Agent）
         self._update_tracking(analysis, event_name, event_summary, [chapter_file])
@@ -1413,11 +1602,16 @@ class NovelWritingSystem:
         logger.info(f"章节摘要：{summary}")
 
         # 8. 更新笔记
-        self.notes.add_event(
-            event_name, event_summary,
-            1, actual_chars,  # 使用实际字数
-            chapter_files=[chapter_file]
+        already_recorded = any(
+            chapter_file in (event.get("chapter_files") or [])
+            for event in self.notes.events_completed
         )
+        if not already_recorded:
+            self.notes.add_event(
+                event_name, event_summary,
+                1, actual_chars,
+                chapter_files=[chapter_file]
+            )
         if analysis:
             if 'plot_threads' in analysis:
                 self.notes.update_plot_threads(analysis['plot_threads'])
@@ -1425,14 +1619,78 @@ class NovelWritingSystem:
                 for char, state in analysis['characters'].items():
                     self.notes.update_character_state(char, state)
         self.notes.save()
+        event_index = ctx.event_index
+        if event_index is None:
+            event_index = self._event_index_for_name(event_name)
+        self.store.update_event_status(
+            event_name,
+            "completed",
+            event_index=event_index,
+            chapter_files=[chapter_file],
+        )
+        self.memory.upsert_chapter(
+            CHAPTERS_DIR / chapter_file,
+            event_name=event_name,
+            summary=summary,
+            volume=self.notes.current_volume,
+            text=final_text,
+        )
+        self._sync_manifest_progress()
+        # Clear only after every commit step succeeds; a crash before this
+        # point leaves an idempotent committing checkpoint for recovery.
+        self.store.clear_checkpoint()
 
         logger.info(f"事件完成：{event_name}（{actual_chars}字）")
         print(f"\n{'='*60}")
         print(f"[OK] 完成：{event_name}（{actual_chars}字）")
         print(f"[笔] 笔记已更新：{self.notes.get_summary()}")
         print(f"{'='*60}\n")
-
         return final_text
+
+    def resume_checkpoint(self) -> str:
+        """Resume the last active task, using a saved draft when possible."""
+        checkpoint = self.store.load_checkpoint()
+        if not checkpoint:
+            print("[记] 当前项目没有可恢复的断点。")
+            return ""
+        event_name = checkpoint.get("event_name", "") or "未命名事件"
+        event_summary = checkpoint.get("event_summary", event_name) or event_name
+        draft = self.store.read_checkpoint_draft()
+        if checkpoint.get("stage") == "planning" or not checkpoint.get("event_name"):
+            self.notes.current_volume = int(checkpoint.get("volume", self.notes.current_volume) or self.notes.current_volume)
+            volume_event_index = checkpoint.get("volume_event_index")
+            if volume_event_index is not None:
+                self.notes.current_event_index = self.notes.current_volume_start_index + int(volume_event_index)
+            else:
+                self.notes.current_event_index = int(checkpoint.get("event_index", self.notes.current_event_index) or self.notes.current_event_index)
+            self.notes.save()
+            return self.run_volume(
+                self.notes.current_volume,
+                max_events=get_writing_config().get("max_events_per_volume", 15),
+            ) or ""
+        if checkpoint.get("stage") in {"analyzing", "committing"} and len(draft) >= 100:
+            ctx = ChapterContext(
+                event_name=event_name,
+                event_summary=event_summary,
+                event_index=checkpoint.get("event_index"),
+            )
+            ctx.previous_text = self._get_previous_text()
+            ctx.character_states = self._get_character_states()
+            ctx.plot_threads = self._get_plot_threads()
+            print(f"[记] 使用已保存草稿恢复：{event_name}")
+            return self._finalize_event(
+                draft,
+                ctx,
+                checkpoint.get("chapter_file") or checkpoint.get("planned_chapter_file"),
+            )
+        print(f"[记] 从断点重新开始当前事件：{event_name}")
+        return self.run_event(
+            event_name,
+            event_summary,
+            target_length=get_writing_config().get("target_length", 15000),
+            max_rounds=get_writing_config().get("max_rounds", 3),
+            event_index=checkpoint.get("event_index"),
+        )
 
     def run_volume(self, volume: int, max_events: int = 15):
         """
@@ -1444,7 +1702,13 @@ class NovelWritingSystem:
             max_events: 最大事件数
         """
         # 更新笔记中的卷号
+        previous_volume = self.notes.current_volume
         self.notes.current_volume = volume
+        if not self.notes.volume_start_initialized or previous_volume != volume:
+            self.notes.current_volume_start_index = len(self.notes.events_completed)
+            self.notes.volume_start_initialized = True
+        volume_start_index = self.notes.current_volume_start_index
+        self.notes.save()
 
         logger.info(f"开始写作第{volume}卷")
         print(f"\n{'='*60}")
@@ -1458,20 +1722,20 @@ class NovelWritingSystem:
         print()
 
         # 从笔记中的位置继续
-        start_index = self.notes.current_event_index
+        start_index = min(
+            max(0, self.notes.current_event_index - volume_start_index),
+            max_events,
+        )
 
         for event_num in range(start_index, max_events):
             # 检查停止标志
-            try:
-                from gui import _stop_event
-                if _stop_event.is_set():
-                    logger.info("收到停止信号，中断写作")
-                    print("[!] 收到停止信号，保存进度后停止...")
-                    self.notes.current_event_index = event_num
-                    self.notes.save()
-                    break
-            except ImportError:
-                pass
+            if self.stop_checker():
+                logger.info("收到停止信号，中断写作")
+                print("[!] 收到停止信号，保存进度后停止...")
+                self.notes.current_event_index = volume_start_index + event_num
+                self.notes.save()
+                self._save_checkpoint("planning", "", "", volume_event_index=event_num, status="paused")
+                break
 
             logger.info(f"规划第{event_num + 1}个事件")
             print(f"\n{'='*40}")
@@ -1483,9 +1747,35 @@ class NovelWritingSystem:
                 volume, self.chapter_summaries
             )
 
+            # 检查停止标志
+            if self.stop_checker():
+                logger.info("用户请求停止，保存笔记...")
+                self.notes.save()
+                self._save_checkpoint("planning", event_name, event_summary, volume_event_index=event_num, status="paused")
+                gui_print("\n[停]  已停止！笔记已保存。")
+                gui_print(f"[析] 中断时进度：{self.notes.get_summary()}")
+                gui_print(" 下次运行将继续从此处开始")
+                return
+
             # 运行事件
             try:
-                result = self.run_event(event_name, event_summary, target_length=15000, max_rounds=3)
+                event_index = None
+                event_index = self._event_index_for_name(event_name)
+                if event_index is None:
+                    event_index = event_num
+                self._save_checkpoint(
+                    "writing", event_name, event_summary,
+                    event_index=event_index,
+                    volume_event_index=event_num,
+                    status="running",
+                )
+                result = self.run_event(
+                    event_name,
+                    event_summary,
+                    target_length=get_writing_config().get("target_length", 15000),
+                    max_rounds=get_writing_config().get("max_rounds", 3),
+                    event_index=event_index,
+                )
                 logger.info(f"事件完成：{event_name}（{len(result)}字）")
 
                 # 每个事件完成后显示进度
@@ -1503,11 +1793,27 @@ class NovelWritingSystem:
             except Exception as e:
                 logger.error(f"事件失败：{event_name}（{str(e)[:100]}）")
                 print(f"[X] 事件失败：{event_name}")
+                self.store.update_event_status(
+                    event_name, "failed", event_index=event_index, error=str(e)[:200]
+                )
+                self._save_checkpoint(
+                    "writing", event_name, event_summary,
+                    event_index=event_index, status="failed",
+                )
+                break
+
+            if self.stop_checker():
+                self.notes.save()
+                self._save_checkpoint("planning", event_name, event_summary, volume_event_index=event_num, status="paused")
+                break
 
             # 短暂休息
             if event_num < max_events - 1:
                 print("[等] 等待3秒...")
-                time.sleep(3)
+                for _ in range(30):
+                    if self.stop_checker():
+                        break
+                    time.sleep(0.1)
 
         # 卷完成
         logger.info(f"第{volume}卷写作完成")
@@ -1515,6 +1821,70 @@ class NovelWritingSystem:
         print(f"[卷] 第{volume}卷写作完成！")
         print(f"[析] 最终进度：{self.notes.get_summary()}")
         print(f"{'='*60}")
+
+    def _save_checkpoint(
+        self,
+        stage: str,
+        event_name: str,
+        event_summary: str,
+        *,
+        status: str = "running",
+        draft_text: Optional[str] = None,
+        **extra,
+    ):
+        """Persist enough state to resume after stop, crash, or app restart."""
+        state = {
+            "status": status,
+            "stage": stage,
+            "event_name": event_name,
+            "event_summary": event_summary,
+            "volume": self.notes.current_volume,
+            "event_index": self.notes.current_event_index,
+            "chapter_count": self.chapter_count,
+            "recent_chapters": [p.name for p in sorted(CHAPTERS_DIR.glob("ch*.md"))[-3:]],
+            "notes_updated_at": self.notes.last_updated,
+            **extra,
+        }
+        self.store.save_checkpoint(state, draft_text=draft_text)
+
+    def _sync_manifest_progress(self):
+        current_manifest = self.store.load_manifest()
+        has_progress = bool(self.notes.events_completed or self.chapter_count)
+        self.store.update_manifest(
+            status="writing" if has_progress else current_manifest.get("status", "draft"),
+            progress={
+                "current_volume": self.notes.current_volume,
+                "completed_events": len(self.notes.events_completed),
+                "completed_chapters": self.notes.total_chapters,
+                "total_words": self.notes.total_words,
+            },
+        )
+
+    def _event_index_for_name(self, event_name: str) -> Optional[Any]:
+        events, _ = self.store.load_events()
+        candidates = []
+        for event in events:
+            name = event.get("name", event.get("event_name", ""))
+            if str(name) == str(event_name):
+                value = event_identifier(event)
+                candidates.append((event.get("status", "pending"), value))
+        for status, value in candidates:
+            if status not in {"completed", "failed"}:
+                if value is None:
+                    return None
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    return value
+        if candidates:
+            value = candidates[0][1]
+            if value is None:
+                return None
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return value
+        return None
 
     def _load_existing_summaries(self):
         """加载已有章节的摘要"""
@@ -1574,8 +1944,7 @@ class NovelWritingSystem:
         """获取前文内容"""
         chapter_files = sorted(CHAPTERS_DIR.glob("ch*.md"))
         if chapter_files:
-            last_chapter = chapter_files[-1]
-            return last_chapter.read_text(encoding='utf-8')
+            return self.memory.build_context(max_chars=2500)
         return ""
 
     def _get_character_states(self) -> Dict[str, str]:
@@ -1711,15 +2080,17 @@ class NovelWritingSystem:
             (章节文件名, 实际字数)
         """
         # 保存原始版本
-        raw_file = RAW_DIR / f"event_{event_name}.txt"
-        raw_file.write_text(text, encoding='utf-8')
+        safe_event_name = safe_filename(event_name)
+        next_chapter_number = self.chapter_count + 1
+        raw_file = RAW_DIR / f"event_{next_chapter_number:03d}_{safe_event_name}.txt"
+        atomic_write_text(raw_file, text, backup=True)
         print(f"  [存] 原始版本：{raw_file}")
 
         # 保存为一章（不拆分）
-        self.chapter_count += 1
-        filename = f"ch{self.chapter_count:03d}_{event_name}.md"
+        self.chapter_count = next_chapter_number
+        filename = chapter_filename(self.chapter_count, safe_event_name)
         ch_file = CHAPTERS_DIR / filename
-        ch_file.write_text(text, encoding='utf-8')
+        atomic_write_text(ch_file, text, backup=True)
 
         # 计算实际字数（去除空白字符）
         actual_chars = len(text.replace('\n', '').replace(' ', '').replace('\r', ''))
@@ -1967,13 +2338,14 @@ class AssistantAgent:
 
     def __init__(self, story_context: StoryContext):
         self.story_context = story_context
+        self.project_dir = story_context.project_dir
 
     def update_tracking(self, event_name: str, event_summary: str, chapter_files: List[str], analysis: Dict):
         """更新tracking.md文件"""
         logger.info(f"助手Agent更新tracking.md：{event_name}")
         logger.info(f"事件概述：{event_summary[:100]}...")
 
-        tracking_file = PROJECT_DIR / "tracking.md"
+        tracking_file = self.project_dir / "tracking.md"
 
         # 读取现有内容或创建新文件
         if tracking_file.exists():
@@ -1992,7 +2364,7 @@ class AssistantAgent:
 
         # 写入文件
         new_content = self._build_tracking_content(sections)
-        tracking_file.write_text(new_content, encoding='utf-8')
+        atomic_write_text(tracking_file, new_content, backup=True)
         logger.info("tracking.md更新完成")
 
     def _create_tracking_template(self) -> str:
@@ -2167,7 +2539,7 @@ class AssistantAgent:
 
     def _update_characters_file(self, characters: Dict[str, str]):
         """更新characters.md"""
-        characters_file = PROJECT_DIR / "characters.md"
+        characters_file = self.project_dir / "characters.md"
         if not characters_file.exists():
             return
 
@@ -2181,7 +2553,7 @@ class AssistantAgent:
 
     def _update_story_plan_file(self, event_name: str, plot_progress: str):
         """更新story_plan.md"""
-        story_plan_file = PROJECT_DIR / "story_plan.md"
+        story_plan_file = self.project_dir / "story_plan.md"
         if not story_plan_file.exists():
             return
 
@@ -2320,21 +2692,27 @@ def save_story_framework(framework: dict, project_dir: Path = None):
     """将故事框架保存到项目文件"""
     if project_dir is None:
         project_dir = PROJECT_DIR
+    project_dir = Path(project_dir)
+    store = ProjectStore(project_dir)
+    store.ensure_structure()
 
     if framework.get("story_plan"):
-        (project_dir / "story_plan.md").write_text(framework["story_plan"], encoding="utf-8")
+        atomic_write_text(project_dir / "story_plan.md", framework["story_plan"], backup=True)
     if framework.get("characters"):
-        (project_dir / "characters.md").write_text(framework["characters"], encoding="utf-8")
+        atomic_write_text(project_dir / "characters.md", framework["characters"], backup=True)
     if framework.get("events_config"):
         try:
             events = json.loads(framework["events_config"])
-            (project_dir / "events_config.json").write_text(
-                json.dumps(events, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
+            atomic_write_json(project_dir / "events_config.json", events, backup=True)
+            store.ensure_event_indices()
         except json.JSONDecodeError:
-            (project_dir / "events_config.json").write_text(framework["events_config"], encoding="utf-8")
+            atomic_write_text(project_dir / "events_config.json", framework["events_config"], backup=True)
     if framework.get("tracking"):
-        (project_dir / "tracking.md").write_text(framework["tracking"], encoding="utf-8")
+        atomic_write_text(project_dir / "tracking.md", framework["tracking"], backup=True)
+
+    premise = framework.get("premise", "")
+    if premise:
+        store.update_manifest(premise=premise, status="outlined")
 
     gui_print(f"[OK] 故事框架已保存到 {project_dir}")
 
@@ -2345,16 +2723,25 @@ def _run_cli():
     """命令行模式入口"""
     import sys
 
-    system = NovelWritingSystem()
+    project_dir = None
+    cli_args = list(sys.argv[1:])
+    if "--project" in cli_args:
+        position = cli_args.index("--project")
+        if position + 1 < len(cli_args):
+            project_dir = Path(cli_args[position + 1])
+            del cli_args[position:position + 2]
+            sys.argv = [sys.argv[0]] + cli_args
+    system = NovelWritingSystem(project_dir)
 
     if len(sys.argv) < 2 or sys.argv[1] == "--help":
         print("""
 AI 网文写作系统 — 命令行模式
 
 用法：
-    python agents.py --cli <事件名称> [事件概述]
-    python agents.py --cli --volume <卷号> [--max-events <数量>]
-    python agents.py --cli --status
+    python agents.py --cli --project <项目目录> <事件名称> [事件概述]
+    python agents.py --cli --project <项目目录> --volume <卷号> [--max-events <数量>]
+    python agents.py --cli --project <项目目录> --status
+    python agents.py --cli --project <项目目录> --resume
     python agents.py --cli --reset
     python agents.py --cli --config [show|set <key> <value>]
 
@@ -2370,12 +2757,28 @@ AI 网文写作系统 — 命令行模式
         gui_print(f"\n[析] 当前创作状态：")
         gui_print(f"{'='*60}")
         gui_print(system.notes.get_summary())
+        summary = system.store.summary()
+        checkpoint = summary.get("checkpoint")
+        if checkpoint:
+            gui_print(
+                f"断点：{checkpoint.get('stage', 'writing')} / "
+                f"{checkpoint.get('event_name', '写作任务')}"
+            )
+        else:
+            gui_print("断点：无")
+        gui_print(f"项目目录：{system.project_dir}")
+        gui_print(f"{'='*60}")
+
+    elif cmd == "--resume":
+        system.resume_checkpoint()
+        gui_print(system.notes.get_summary())
         gui_print(f"{'='*60}")
 
     elif cmd == "--reset":
         if gui_confirm("确定要重置所有进度吗？"):
-            system.notes = WritingNotes()
+            system.notes = WritingNotes(file_path=system.project_dir / "writing_notes.json")
             system.notes.save()
+            system.store.clear_checkpoint()
             gui_print("[OK] 进度已重置")
 
     elif cmd == "--config":

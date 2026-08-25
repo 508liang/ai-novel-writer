@@ -1,6 +1,6 @@
 # AI 网文写作系统
 
-基于多 Agent 架构的 AI 网文创作工具。5 个不同风格的写作 Agent 并行创作，审查 Agent 六维度评分，导演 Agent 智能决策。
+基于多 Agent 架构的长篇小说创作工具：用户可以从一句话、设定或大纲开始，逐步扩展到数万字、数十万字乃至百万字级连载。系统把项目资料、章节、记忆索引和写作任务检查点分开保存，适合长期创作。
 
 ## 功能特点
 
@@ -12,18 +12,20 @@
 - 📝 **续写功能**：基于已写内容自动生成后续事件
 - ⏸️ **断点续写**：随时中断，下次自动从断点继续
 - 🖥️ **图形界面**：直观的 GUI 操作，无需命令行
+- 🧭 **长期记忆索引**：为章节建立轻量索引，写作时组合最近章节与相关章节，避免百万字作品上下文失控
+- 💾 **原子保存与草稿恢复**：关键 JSON、设定、章节写入均可恢复；分析前保存草稿，程序异常退出也能继续
 
 ## 快速开始
 
 ### 方式一：下载 exe（推荐）
 
-在 [Releases](https://github.com/你的用户名/ai-novel-writer/releases) 页面下载最新版本的 `AI网文写作系统.exe`，双击即可运行。
+在 [Releases](https://github.com/508liang/ai-novel-writer/releases) 页面下载最新版本的 `AI网文写作系统.exe`，双击即可运行。
 
 ### 方式二：从源码运行
 
 ```bash
 # 克隆项目
-git clone https://github.com/你的用户名/ai-novel-writer.git
+git clone https://github.com/508liang/ai-novel-writer.git
 cd ai-novel-writer
 
 # 安装依赖（仅打包时需要）
@@ -56,8 +58,10 @@ python build.py
 
 ```
 ai-novel-writer/
-├── gui.py              # GUI 图形界面
-├── agents.py           # 核心 Agent 系统
+├── gui.py              # GUI 图形界面与项目工作台
+├── agents.py           # Agent 编排、写作流程与断点恢复
+├── project_store.py    # 项目元数据、原子保存、事件状态、检查点
+├── memory_index.py     # 章节索引与轻量检索上下文
 ├── build.py            # 打包脚本
 ├── requirements.txt    # 依赖清单
 ├── README.md           # 项目说明
@@ -90,8 +94,29 @@ ai-novel-writer/
 
 - API Key 仅存储在本地项目目录中，不会上传到任何地方
 - 每个项目可使用不同的 API 服务
-- 支持暂停/继续：随时点击「停止」中断，再次运行自动继续
+- 支持暂停/继续：点击「停止」后当前阶段结束即保存 `checkpoint.json`；重启后点击「恢复上次断点」继续
+- 每个项目会自动生成 `project.json`、`memory/chapter_index.json`、`checkpoint.json`（仅有活动任务时）和 `.bak` 备份文件
 - 所有数据存储在 `projects/` 目录下，删除项目即删除所有相关数据
+
+## 项目数据结构
+
+```text
+projects/我的小说/
+├── project.json              # 项目身份、创作状态、累计进度
+├── config.json               # 当前项目 API 与写作参数
+├── story_plan.md             # 故事大纲
+├── characters.md             # 角色设定
+├── events_config.json        # 事件队列及待写/进行中/已完成状态
+├── writing_notes.json        # 长期创作笔记、角色状态、伏笔
+├── tracking.md               # 兼容旧项目的可读追踪文件
+├── chapters/                 # 正式章节
+├── raw/                      # 事件原始文本
+├── memory/chapter_index.json # 章节摘要与检索索引
+├── backups/                  # 预留的项目级备份目录
+└── checkpoint.json           # 活动任务检查点（无任务时不存在）
+```
+
+旧项目只要仍保留原有 `chapters/`、`story_plan.md`、`characters.md` 等文件即可直接导入；系统只补齐缺失目录和元数据，不会重写旧章节。
 
 ## License
 

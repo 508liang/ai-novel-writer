@@ -2,6 +2,14 @@
 config.json
 projects/*/config.json
 dist/data/*/config.json
+.last_project
+project.json
+writing_notes.json
+events_config.json
+story_plan.md
+characters.md
+tracking.md
+outline/
 
 # 生成的章节和日志
 chapters/
@@ -11,6 +19,11 @@ logs/
 
 # 多项目数据（用户创建的故事项目）
 projects/
+memory/
+backups/
+checkpoint.json
+checkpoint_draft.md
+*.bak
 dist/data/
 
 # 打包产物
@@ -24,10 +37,13 @@ __pycache__/
 *.pyo
 *.egg-info/
 .eggs/
+.pytest_cache/
 
 # 测试文件
 test_*.py
 _test.py
+!tests/
+!tests/test_*.py
 
 # IDE
 .vscode/
